@@ -8,18 +8,22 @@ import CryptoKit
 import SwiftUI
 import Translation
 import AVFoundation
+import Speech
+import ApplicationServices
 import UniformTypeIdentifiers
 
 final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDelegate {
  var window:NSWindow!; var web:WKWebView!; let speech=AVSpeechSynthesizer(); var translationWindow:NSWindow?; var database:OpaquePointer?
  let support=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("Youhuo Dictionary")
+ var audioEngine=AVAudioEngine(); var recognitionTask:SFSpeechRecognitionTask?; var recognitionRequest:SFSpeechAudioBufferRecognitionRequest?; var audioTapped=false
+ var selectionMonitor:Any?;var selectionPanel:NSPanel?;var selectionWord="";var selectionMenu:NSMenuItem?
  var stateURL:URL { support.appendingPathComponent("state.json") }
  func applicationDidFinishLaunching(_ n:Notification) {
   try? FileManager.default.createDirectory(at:support,withIntermediateDirectories:true)
   let menu=NSMenu(); let appMenu=NSMenu(); let item=NSMenuItem(); item.submenu=appMenu; menu.addItem(item); appMenu.addItem(withTitle:"关于有活词典",action:#selector(about),keyEquivalent:""); appMenu.addItem(.separator()); appMenu.addItem(withTitle:"退出有活词典",action:#selector(NSApplication.terminate(_:)),keyEquivalent:"q")
   let edit=NSMenu(); let editItem=NSMenuItem(title:"编辑",action:nil,keyEquivalent:""); editItem.submenu=edit; menu.addItem(editItem)
   for (name,action,key) in [("撤销","undo:","z"),("剪切","cut:","x"),("复制","copy:","c"),("粘贴","paste:","v"),("全选","selectAll:","a")] {edit.addItem(withTitle:name,action:Selector(action),keyEquivalent:key)}
-  NSApp.mainMenu=menu
+  let toolsMenu=NSMenu();let toolsItem=NSMenuItem(title:"工具",action:nil,keyEquivalent:"");toolsItem.submenu=toolsMenu;menu.addItem(toolsItem);toolsMenu.addItem(withTitle:"查询剪贴板文本",action:#selector(lookupClipboard),keyEquivalent:"l");let selectionItem=NSMenuItem(title:"开启划词查询",action:#selector(toggleSelectionMenu),keyEquivalent:"");toolsMenu.addItem(selectionItem);selectionMenu=selectionItem;NSApp.mainMenu=menu;NSApp.servicesProvider=self;NSUpdateDynamicServices()
   let config=WKWebViewConfiguration(); config.userContentController.add(self,name:"native")
   let data=(try? Data(contentsOf:stateURL)) ?? Data("null".utf8)
   let encoded=data.base64EncodedString(); config.userContentController.addUserScript(WKUserScript(source:"try {window.__initialData=JSON.parse(decodeURIComponent(escape(atob('\(encoded)'))));}catch(e){window.__initialData=null}",injectionTime:.atDocumentStart,forMainFrameOnly:true))
@@ -30,15 +34,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
   NSApp.activate(ignoringOtherApps:true)
  }
  func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool {true}
+ @objc func lookupClipboard(){if let text=NSPasteboard.general.string(forType:.string),!text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {window.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true);emit("query",["text":String(text.prefix(500))])}else{error("剪贴板没有文本")}}
+ @objc func lookupSelection(_ pasteboard:NSPasteboard,userData:String?,error:AutoreleasingUnsafeMutablePointer<NSString?>){if let text=pasteboard.string(forType:.string){window.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true);emit("query",["text":String(text.prefix(500))])}}
+ func applicationWillTerminate(_ notification:Notification){disableSelection();stopTranscription();speech.stopSpeaking(at:.immediate);sqlite3_close(database)}
  @objc func about(){NSApp.orderFrontStandardAboutPanel(options:[.applicationName:"有活词典",.applicationVersion:"1.0",.credits:NSAttributedString(string:"独立词典应用 · 离线词库与本地学习记录")])}
  func emit(_ event:String,_ value:Any) {DispatchQueue.main.async {guard let data=try? JSONSerialization.data(withJSONObject:value,options:[.fragmentsAllowed]),let json=String(data:data,encoding:.utf8),let e=try? JSONSerialization.data(withJSONObject:event,options:[.fragmentsAllowed]),let eventJSON=String(data:e,encoding:.utf8) else{return}; self.web.evaluateJavaScript("window.receiveNative && window.receiveNative(\(eventJSON),\(json))",completionHandler:nil)}}
  func error(_ message:String,_ id:Any="") {emit("error",["id":id,"message":message])}
  func userContentController(_ u:WKUserContentController,didReceive m:WKScriptMessage) {
   guard let p=m.body as? [String:Any] else{return}; let action=p["action"] as? String ?? p["type"] as? String ?? ""; let raw=p["payload"] as? [String:Any] ?? p; let id=raw["id"] ?? ""
   switch action {
+  case "toggleSelection": toggleSelection(raw["enabled"] as? Bool ?? false)
   case "lookup": lookup(raw)
   case "save": do {let obj=p["payload"] ?? p["data"] ?? raw["state"] ?? raw; let data=try JSONSerialization.data(withJSONObject:obj,options:[.sortedKeys]); if FileManager.default.fileExists(atPath:stateURL.path){try? FileManager.default.removeItem(at:support.appendingPathComponent("state.previous.json")); try? FileManager.default.copyItem(at:stateURL,to:support.appendingPathComponent("state.previous.json"))}; try data.write(to:stateURL,options:.atomic)}catch{self.error("保存失败")}
   case "speak": speech.stopSpeaking(at:.immediate); let utterance=AVSpeechUtterance(string:raw["text"] as? String ?? ""); utterance.voice=AVSpeechSynthesisVoice(language:raw["lang"] as? String ?? "en-US"); speech.speak(utterance)
+  case "startTranscription": startTranscription(raw)
+  case "stopTranscription": stopTranscription()
+  case "importTranscription": importTranscription(raw)
   case "stopSpeech": speech.stopSpeaking(at:.immediate)
   case "copy": NSPasteboard.general.clearContents(); NSPasteboard.general.setString(raw["text"] as? String ?? "",forType:.string)
   case "importDocument": importDocument()
@@ -52,6 +63,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
   default: break
   }
  }
+ @objc func toggleSelectionMenu(){toggleSelection(selectionMonitor == nil)}
+ func disableSelection(){if let monitor=selectionMonitor{NSEvent.removeMonitor(monitor)};selectionMonitor=nil;selectionPanel?.orderOut(nil);selectionPanel=nil;selectionMenu?.title="开启划词查询"}
+ func toggleSelection(_ enabled:Bool){
+  if !enabled {disableSelection();emit("selectionState",["enabled":false]);return}
+  guard AXIsProcessTrusted() else {
+   let alert=NSAlert();alert.messageText="开启划词查询";alert.informativeText="读取其他应用中你选中的文字，并仅在本机离线查词。此功能需要在 macOS 系统设置的辅助功能中授权有活词典。不会读取剪贴板，也不会发送选中文字到网络。";alert.addButton(withTitle:"前往授权");alert.addButton(withTitle:"取消")
+   if alert.runModal() == .alertFirstButtonReturn {let options=[kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary;_ = AXIsProcessTrustedWithOptions(options)}
+   emit("selectionState",["enabled":false,"needsPermission":true]);emit("status",["message":"划词查询仍已关闭。授权后请再次点击开启。"]);return
+  }
+  guard selectionMonitor == nil else{return}
+  selectionMonitor=NSEvent.addGlobalMonitorForEvents(matching:.leftMouseUp){_ in DispatchQueue.main.asyncAfter(deadline:.now()+0.25){self.readSelection()}}
+  selectionMenu?.title="关闭划词查询";emit("selectionState",["enabled":selectionMonitor != nil]);emit("status",["message":"划词查询已开启，仅使用离线词库"])
+ }
+ func readSelection(){
+  guard selectionMonitor != nil,NSWorkspace.shared.frontmostApplication?.processIdentifier != ProcessInfo.processInfo.processIdentifier else{return}
+  var focused:CFTypeRef?;guard AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(),kAXFocusedUIElementAttribute as CFString,&focused) == .success,let focused=focused,CFGetTypeID(focused)==AXUIElementGetTypeID() else{return}
+  let element=unsafeBitCast(focused,to:AXUIElement.self);var selected:CFTypeRef?;guard AXUIElementCopyAttributeValue(element,kAXSelectedTextAttribute as CFString,&selected) == .success,let text=selected as? String else{return}
+  let q=text.trimmingCharacters(in:.whitespacesAndNewlines);guard !q.isEmpty,q.count<=100,!q.contains("\n") else{selectionPanel?.orderOut(nil);return}
+  selectionWord=q
+  let ascii=q.unicodeScalars.allSatisfy{$0.value<128};let sql=ascii ? "SELECT phonetic,translation FROM entries WHERE word=? COLLATE NOCASE LIMIT 1" : "SELECT phonetic,translation FROM entries WHERE translation LIKE ? LIMIT 1";var stmt:OpaquePointer?;var phonetic="";var translation="离线词库未找到结果，可打开主窗口查看建议。"
+  if sqlite3_prepare_v2(database,sql,-1,&stmt,nil)==SQLITE_OK{let param=ascii ? q : "%\(q)%";sqlite3_bind_text(stmt,1,param,-1,unsafeBitCast(-1,to:sqlite3_destructor_type.self));if sqlite3_step(stmt)==SQLITE_ROW{phonetic=sqlite3_column_text(stmt,0).map{String(cString:$0)} ?? "";translation=sqlite3_column_text(stmt,1).map{String(cString:$0)} ?? ""}};sqlite3_finalize(stmt)
+  let panel=selectionPanel ?? NSPanel(contentRect:NSRect(x:0,y:0,width:350,height:205),styleMask:[.nonactivatingPanel,.titled,.closable],backing:.buffered,defer:false);selectionPanel=panel;panel.title="有活词典 · 划词";panel.level = .floating;panel.hidesOnDeactivate=false;panel.isReleasedWhenClosed=false
+  let view=NSView(frame:NSRect(x:0,y:0,width:350,height:205));let title=NSTextField(labelWithString:q);title.font = .boldSystemFont(ofSize:18);title.frame=NSRect(x:16,y:158,width:318,height:27);view.addSubview(title);let phon=NSTextField(labelWithString:phonetic);phon.textColor = .secondaryLabelColor;phon.frame=NSRect(x:16,y:131,width:318,height:22);view.addSubview(phon);let meaning=NSTextField(wrappingLabelWithString:translation.replacingOccurrences(of:"\\n",with:"\n"));meaning.frame=NSRect(x:16,y:47,width:318,height:80);view.addSubview(meaning);let button=NSButton(title:"打开词条",target:self,action:#selector(openSelectedWord));button.frame=NSRect(x:234,y:10,width:100,height:30);view.addSubview(button);panel.contentView=view
+  let cursor=NSEvent.mouseLocation;let bounds=(NSScreen.screens.first{$0.frame.contains(cursor)} ?? NSScreen.main)?.visibleFrame ?? NSRect(x:0,y:0,width:1440,height:900);panel.setFrameOrigin(NSPoint(x:min(max(cursor.x+12,bounds.minX),bounds.maxX-350),y:min(max(cursor.y-225,bounds.minY),bounds.maxY-230)));panel.orderFrontRegardless()
+ }
+ @objc func openSelectedWord(){selectionPanel?.orderOut(nil);window.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true);emit("query",["text":selectionWord])}
  func lookup(_ p:[String:Any]) {
   let q=(p["query"] as? String ?? "").trimmingCharacters(in:.whitespacesAndNewlines); let id=p["id"] ?? ""; guard !q.isEmpty,q.count<500 else{emit("lookup",["id":id,"query":q,"entries":[],"suggestions":[]]);return}
   guard database != nil else{error("离线词库未安装",id);return}
@@ -74,6 +111,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
    }catch{DispatchQueue.main.async{self.window.makeKeyAndOrderFront(nil)};self.error("截图识别失败，请检查 macOS 屏幕录制权限，或使用图片识别导入")}
   }
  }
+ func stopTranscription(){audioEngine.stop();if audioTapped {audioEngine.inputNode.removeTap(onBus:0);audioTapped=false};recognitionRequest?.endAudio();recognitionRequest=nil;recognitionTask?.cancel();recognitionTask=nil}
+ func speechPermission(_ completion:@escaping(Bool)->Void){SFSpeechRecognizer.requestAuthorization{status in DispatchQueue.main.async{completion(status == .authorized)}}}
+ func recognizer(_ p:[String:Any])->SFSpeechRecognizer? {guard let rec=SFSpeechRecognizer(locale:Locale(identifier:p["lang"] as? String ?? "en-US")),rec.isAvailable,rec.supportsOnDeviceRecognition else{error("当前语言或设备不支持离线语音识别，请尝试英语或普通话并检查系统语言模型。");return nil};return rec}
+ func startTranscription(_ p:[String:Any]) {
+  stopTranscription();speechPermission{allowed in guard allowed else{self.error("语音识别权限未开启，可在系统设置中允许有活词典。");return};AVCaptureDevice.requestAccess(for:.audio){granted in DispatchQueue.main.async{guard granted else{self.error("麦克风权限未开启");return};guard let recognizer=self.recognizer(p) else{return};let request=SFSpeechAudioBufferRecognitionRequest();request.requiresOnDeviceRecognition=true;request.shouldReportPartialResults=true;self.recognitionRequest=request;let node=self.audioEngine.inputNode;let format=node.outputFormat(forBus:0);guard format.sampleRate>0,format.channelCount>0 else{self.error("没有可用麦克风");return};node.installTap(onBus:0,bufferSize:1024,format:format){buffer,_ in request.append(buffer)};self.audioTapped=true
+   self.recognitionTask=recognizer.recognitionTask(with:request){result,error in if let result=result {self.emit("transcript",["text":result.bestTranscription.formattedString,"final":result.isFinal]);if result.isFinal{DispatchQueue.main.async{self.stopTranscription()}}};if let error=error as NSError?,error.code != 216 {self.error("本地语音识别未完成，请检查语言模型或重试。");DispatchQueue.main.async{self.stopTranscription()}}};do{self.audioEngine.prepare();try self.audioEngine.start();self.emit("status",["message":"正在本地识别，请说话；点击停止结束。"])}catch{self.stopTranscription();self.error("麦克风录音启动失败")}
+  }}}
+ }
+ func importTranscription(_ p:[String:Any]) {speechPermission{allowed in guard allowed else{self.error("语音识别权限未开启");return};let panel=NSOpenPanel();panel.allowedContentTypes=[.audio];guard panel.runModal() == .OK,let url=panel.url,let recognizer=self.recognizer(p) else{return};self.stopTranscription();let request=SFSpeechURLRecognitionRequest(url:url);request.requiresOnDeviceRecognition=true;request.shouldReportPartialResults=true;self.recognitionTask=recognizer.recognitionTask(with:request){result,error in if let result=result {self.emit("transcript",["text":result.bestTranscription.formattedString,"final":result.isFinal]);if result.isFinal{DispatchQueue.main.async{self.recognitionTask=nil}}};if error != nil {self.error("音频文件本地识别失败，请检查格式、时长或语言模型。")}}}}
  func exportState(_ p:[String:Any]) {let panel=NSSavePanel(); panel.nameFieldStringValue="有活词典备份.json"; panel.allowedContentTypes=[.json]; if panel.runModal() == .OK,let url=panel.url {do{let data:Data; if let state=p["state"] {data=try JSONSerialization.data(withJSONObject:state)} else {data=try Data(contentsOf:stateURL)};try data.write(to:url,options:.atomic);emit("status",["message":"备份已导出"])}catch{self.error("导出失败")}}}
  func importState(){let panel=NSOpenPanel(); panel.allowedContentTypes=[.json]; if panel.runModal() == .OK,let url=panel.url {do{let data=try Data(contentsOf:url);guard data.count<20_000_000,let obj=try JSONSerialization.jsonObject(with:data) as? [String:Any] else{error("备份格式无效");return}; if FileManager.default.fileExists(atPath:stateURL.path){try? FileManager.default.copyItem(at:stateURL,to:support.appendingPathComponent("state.before-import-\(UUID().uuidString).json"))}; emit("importData",obj)}catch{self.error("备份读取失败")}}}
  func secret(_ name:String)->String? {let q:[String:Any]=[kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:"com.mario.youhuo",kSecAttrAccount as String:name,kSecReturnData as String:true];var result:CFTypeRef?;guard SecItemCopyMatching(q as CFDictionary,&result)==errSecSuccess,let d=result as? Data else{return nil};return String(data:d,encoding:.utf8)}
