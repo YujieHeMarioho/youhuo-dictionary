@@ -1,0 +1,7 @@
+build/
+*.app
+*.zip
+.DS_Store
+data/*.csv
+data/*.sqlite
+.env*
